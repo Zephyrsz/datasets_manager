@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+.venv/
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+.env
+artifacts/
