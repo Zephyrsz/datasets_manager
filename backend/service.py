@@ -5,7 +5,8 @@ import wave
 
 from fastapi import HTTPException
 
-from import_dataset import REGISTRY_SQL, import_dataset, read_source
+from import_dataset import REGISTRY_SQL, RegistrationConflict, import_dataset, read_source
+from register_result import register_result
 from .models import DatasetConfig
 
 
@@ -87,8 +88,40 @@ class DatasetService:
         )
         return self.get_dataset(result["dataset_id"])
 
+    def register_result(self, config):
+        root = Path(config.storage_dir).expanduser()
+        if not root.is_absolute():
+            raise HTTPException(400, "数据集根目录必须是后端服务器上的绝对路径")
+        try:
+            result = register_result(
+                db=self.database, name=config.name, root=root,
+                audio_subdir=config.audio_subdir, transcript=config.transcript_path,
+            )
+        except RegistrationConflict as error:
+            raise HTTPException(409, str(error)) from error
+        return {
+            "status": result["registration_status"],
+            "dataset": self.get_dataset(result["dataset_id"]),
+            "import_result": result,
+        }
+
     def configure(self, dataset_id, config):
-        self.get_dataset(dataset_id)
+        current = self.get_dataset(dataset_id)
+        new_root = Path(config.storage_dir).expanduser()
+        old_root = Path(current["storage_dir"])
+        if (new_root.is_absolute() and new_root.resolve() != old_root
+                and config.transcript_path
+                and config.transcript_path == current["transcript_path"]):
+            # Stored paths are absolute. Keep a dataset-local transcript attached to
+            # its root when only that root changes, even if the old directory is gone.
+            try:
+                relative_transcript = Path(config.transcript_path).relative_to(old_root)
+            except ValueError:
+                pass  # An explicitly external transcript stays at its own location.
+            else:
+                config = config.model_copy(update={
+                    "transcript_path": str(new_root / relative_transcript),
+                })
         root, subdir, transcript, records = self.source(config)
         table = self.table_name(dataset_id)
         with self.connect(write=True) as conn:

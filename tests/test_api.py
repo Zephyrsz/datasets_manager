@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -81,6 +82,62 @@ class ApiTests(unittest.TestCase):
         response = self.client.put("/api/datasets/1", json={"name": "oops", "storage_dir": "/path/does/not/exist"})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get("/api/datasets/1").json()["name"], "basic")
+
+    def test_moving_root_relocates_unchanged_internal_transcript_without_reimport(self):
+        self.client.patch("/api/datasets/1/records/1", json={"subtitle": "手动修改"})
+        original = self.client.get("/api/datasets/1").json()
+        with closing(sqlite3.connect(self.db)) as conn:
+            records = conn.execute("SELECT id, audio_name, subtitle FROM audio_dataset_1 ORDER BY id").fetchall()
+        moved = self.base / "moved-basic"
+        self.root.rename(moved)
+        response = self.client.put("/api/datasets/1", json={
+            "name": "basic", "storage_dir": f"{moved} ", "audio_subdir": "wav",
+            "transcript_path": original["transcript_path"],
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["storage_dir"], str(moved))
+        self.assertEqual(response.json()["transcript_path"], str(moved / "transcript.txt"))
+        self.assertEqual(response.json()["record_count"], 2)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id, audio_name, subtitle FROM audio_dataset_1 ORDER BY id").fetchall(), records)
+        self.assertTrue(all(item["audio_available"] for item in self.client.get("/api/datasets/1/records").json()["items"]))
+        self.assertEqual(self.client.get("/api/datasets/1/records/1/audio").content[:4], b"RIFF")
+
+    def test_moving_root_preserves_an_unchanged_external_transcript(self):
+        external = self.base / "shared-transcript.txt"
+        external.write_text((self.root / "transcript.txt").read_text(encoding="utf-8"), encoding="utf-8")
+        config = {"name": "basic", "storage_dir": str(self.root), "transcript_path": str(external)}
+        self.assertEqual(self.client.put("/api/datasets/1", json=config).status_code, 200)
+        moved = self.base / "moved-basic"
+        self.root.rename(moved)
+        response = self.client.put("/api/datasets/1", json={**config, "storage_dir": str(moved)})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transcript_path"], str(external))
+
+    def test_moving_root_respects_an_explicitly_changed_transcript(self):
+        moved = self.base / "moved-basic"
+        self.root.rename(moved)
+        chosen = self.base / "chosen-transcript.txt"
+        chosen.write_text((moved / "transcript.txt").read_text(encoding="utf-8"), encoding="utf-8")
+        response = self.client.put("/api/datasets/1", json={
+            "name": "basic", "storage_dir": str(moved), "transcript_path": str(chosen),
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transcript_path"], str(chosen))
+
+    def test_missing_transcript_at_new_root_keeps_original_configuration(self):
+        original = self.client.get("/api/datasets/1").json()
+        moved = self.base / "moved-basic"
+        self.make_audio(moved, "A.wav")
+        self.make_audio(moved, "B.wav")
+        response = self.client.put("/api/datasets/1", json={
+            "name": "basic", "storage_dir": str(moved), "transcript_path": original["transcript_path"],
+        })
+        self.assertEqual(response.status_code, 400, response.text)
+        saved = self.client.get("/api/datasets/1").json()
+        self.assertEqual(saved["storage_dir"], original["storage_dir"])
+        self.assertEqual(saved["transcript_path"], original["transcript_path"])
+        self.assertEqual(saved["record_count"], 2)
 
     def test_edits_and_clears_subtitles_without_writing_source_file(self):
         source = (self.root / "transcript.txt").read_bytes()

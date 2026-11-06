@@ -11,6 +11,11 @@ import sys
 
 DEFAULT_DB = Path(__file__).resolve().parent / "datasets.sqlite3"
 
+
+class RegistrationConflict(ValueError):
+    """A registration would change an existing dataset's identity or file set."""
+
+
 REGISTRY_SQL = """
 CREATE TABLE IF NOT EXISTS audio_datasets (
     id              INTEGER PRIMARY KEY CHECK (id > 0),
@@ -90,8 +95,11 @@ def read_source(root, audio_subdir, transcript):
     return root, subdir.as_posix(), transcript_path, records
 
 
-def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, dataset_id=None):
-    """Import atomically; keep stable IDs and reject conflicting registrations."""
+def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, dataset_id=None,
+                   on_existing="update", validate_source=None):
+    """Import one source snapshot, optionally validating it before any DB writes."""
+    if on_existing not in {"update", "reuse"}:
+        raise ValueError("on_existing must be 'update' or 'reuse'")
     if not name.strip():
         raise ValueError("Dataset name must not be empty")
     if dataset_id is not None and (
@@ -99,6 +107,8 @@ def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, datas
     ):
         raise ValueError("dataset_id must be a positive SQLite integer")
     root, audio_subdir, transcript_path, records = read_source(root, audio_subdir, transcript)
+    if validate_source is not None:
+        validate_source(root, audio_subdir, transcript_path, records)
     db = Path(db).expanduser().resolve()
     metadata = (name, str(root), audio_subdir, str(transcript_path) if transcript_path else None)
 
@@ -115,7 +125,7 @@ def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, datas
                 if len(matches) != 1 or tuple(matches[0][1:]) != metadata or (
                     dataset_id is not None and matches[0][0] != dataset_id
                 ):
-                    raise ValueError("Conflicting dataset registration; existing metadata was preserved")
+                    raise RegistrationConflict("Conflicting dataset registration; existing metadata was preserved")
                 dataset_id = matches[0][0]
                 is_new = False
             else:
@@ -139,26 +149,36 @@ def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, datas
                 raise ValueError(f"Registered detail table is missing: {table_name}")
 
             existing = dict(conn.execute(f"SELECT audio_name, subtitle FROM {table_name}"))
+            reuse = not is_new and on_existing == "reuse"
+            if reuse and existing.keys() != {name for name, _ in records}:
+                raise RegistrationConflict(
+                    "Registered audio file set changed; use a new dataset name and directory"
+                )
             removed = sorted(existing.keys() - {name for name, _ in records})
             if removed:
                 raise ValueError(
                     f"{len(removed)} registered audio files are missing from the source; "
                     f"no records were deleted: {removed[:3]}"
                 )
-            inserted = sum(audio_name not in existing for audio_name, _ in records)
-            updated = sum(
-                audio_name in existing and existing[audio_name] != subtitle
-                for audio_name, subtitle in records
-            )
-            conn.executemany(
-                f"INSERT INTO {table_name} (audio_name, subtitle) VALUES (?, ?) "
-                "ON CONFLICT(audio_name) DO UPDATE SET subtitle = excluded.subtitle "
-                "WHERE subtitle IS NOT excluded.subtitle",
-                records,
-            )
+            inserted = updated = 0
+            if not reuse:
+                inserted = sum(audio_name not in existing for audio_name, _ in records)
+                updated = sum(
+                    audio_name in existing and existing[audio_name] != subtitle
+                    for audio_name, subtitle in records
+                )
+                conn.executemany(
+                    f"INSERT INTO {table_name} (audio_name, subtitle) VALUES (?, ?) "
+                    "ON CONFLICT(audio_name) DO UPDATE SET subtitle = excluded.subtitle "
+                    "WHERE subtitle IS NOT excluded.subtitle",
+                    records,
+                )
             total = conn.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+            null_subtitles = conn.execute(
+                f"SELECT count(*) FROM {table_name} WHERE subtitle IS NULL"
+            ).fetchone()[0]
 
-    return {
+    result = {
         "database": str(db),
         "dataset_id": dataset_id,
         "detail_table": table_name,
@@ -166,8 +186,11 @@ def import_dataset(*, db, name, root, audio_subdir="wav", transcript=None, datas
         "inserted_records": inserted,
         "updated_records": updated,
         "unchanged_records": total - inserted - updated,
-        "null_subtitles": sum(subtitle is None for _, subtitle in records),
+        "null_subtitles": null_subtitles,
     }
+    if on_existing == "reuse":
+        result["registration_status"] = "created" if is_new else "existing"
+    return result
 
 
 def main():

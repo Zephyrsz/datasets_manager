@@ -36,6 +36,42 @@ export interface DatasetConfig {
   transcript_path: string | null
 }
 
+export interface AudioConfig {
+  name: string
+  file_path: string
+  kind: 'source' | 'reference'
+  speaker: string | null
+  language: string | null
+  reference_text: string | null
+  notes: string | null
+}
+
+export interface AudioAsset extends AudioConfig {
+  id: number
+  duration_seconds: number
+  size_bytes: number
+  sample_rate: number
+  channels: number
+  codec: string
+  created_at: string
+  updated_at: string
+  file_available: boolean
+}
+
+export interface AudioPage {
+  items: AudioAsset[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface Playback {
+  key: string
+  title: string
+  subtitle: string
+  path: string
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') ?? '/api'
 
 export function apiUrl(path: string) { return `${API_BASE}${path}` }

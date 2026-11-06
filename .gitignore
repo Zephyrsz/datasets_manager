@@ -9,3 +9,5 @@ frontend/dist/
 *.tsbuildinfo
 .env
 artifacts/
+.run/
+.logs/

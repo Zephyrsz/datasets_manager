@@ -4,12 +4,13 @@ from pathlib import Path
 import sqlite3
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, Path as ApiPath, Query, Request
+from fastapi import FastAPI, Path as ApiPath, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from import_dataset import DEFAULT_DB
-from .models import DatasetConfig, SubtitleUpdate
+from .audio_service import AudioService
+from .models import AudioConfig, DatasetConfig, ResultRegistrationConfig, SubtitleUpdate
 from .service import DatasetService
 
 
@@ -18,6 +19,7 @@ PositiveId = Annotated[int, ApiPath(gt=0, le=9223372036854775807)]
 
 def create_app(database=None):
     service = DatasetService(database or os.environ.get("DATASETS_DB", DEFAULT_DB))
+    audios = AudioService(service)
     origins = [value.strip() for value in os.environ.get(
         "FRONTEND_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173"
     ).split(",") if value.strip()]
@@ -25,12 +27,13 @@ def create_app(database=None):
     @asynccontextmanager
     async def lifespan(app):
         service.initialize()
+        audios.initialize()
         yield
 
     app = FastAPI(title="语音数据集管理 API", version="1.0.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware, allow_origins=origins,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "Range"], expose_headers=["Content-Range", "Accept-Ranges"],
     )
 
@@ -63,9 +66,45 @@ def create_app(database=None):
     def datasets():
         return service.list_datasets()
 
+    @app.get("/api/audios")
+    def list_audios(
+        page: Annotated[int, Query(ge=1, le=10000000)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+        q: Annotated[str, Query(max_length=500)] = "",
+        kind: Literal["all", "source", "reference"] = "all",
+    ):
+        return audios.list(page, page_size, q, kind)
+
+    @app.post("/api/audios", status_code=201)
+    def create_audio(config: AudioConfig):
+        return audios.save(config)
+
+    @app.get("/api/audios/{audio_id}")
+    def get_audio(audio_id: PositiveId):
+        return audios.get(audio_id)
+
+    @app.put("/api/audios/{audio_id}")
+    def update_audio(audio_id: PositiveId, config: AudioConfig):
+        return audios.save(config, audio_id)
+
+    @app.delete("/api/audios/{audio_id}")
+    def remove_audio(audio_id: PositiveId):
+        return audios.remove(audio_id)
+
+    @app.get("/api/audios/{audio_id}/file")
+    def single_audio_file(audio_id: PositiveId):
+        path, media_type = audios.audio_file(audio_id)
+        return FileResponse(path, media_type=media_type)
+
     @app.post("/api/datasets", status_code=201)
     def create_dataset(config: DatasetConfig):
         return service.create(config)
+
+    @app.post("/api/datasets/register", status_code=201)
+    def register_result(config: ResultRegistrationConfig, response: Response):
+        result = service.register_result(config)
+        response.status_code = 201 if result["status"] == "created" else 200
+        return result
 
     @app.get("/api/datasets/{dataset_id}")
     def dataset(dataset_id: PositiveId):
